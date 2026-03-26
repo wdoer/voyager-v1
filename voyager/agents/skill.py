@@ -1,10 +1,10 @@
 import os
 
 import voyager.utils as U
-from langchain.chat_models import ChatOpenAI
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.vectorstores import Chroma
+from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_chroma import Chroma
 
 from voyager.prompts import load_prompt
 from voyager.control_primitives import load_control_primitives
@@ -19,12 +19,34 @@ class SkillManager:
         request_timout=120,
         ckpt_dir="ckpt",
         resume=False,
+        llm_provider="ollama",
+        llm_api_key=None,
+        llm_base_url=None,
     ):
-        self.llm = ChatOpenAI(
-            model_name=model_name,
-            temperature=temperature,
-            request_timeout=request_timout,
-        )
+        if llm_provider == "groq":
+            from langchain_groq import ChatGroq
+            self.llm = ChatGroq(
+                model_name=model_name,
+                temperature=temperature,
+                request_timeout=request_timout,
+                groq_api_key=llm_api_key,
+            )
+        elif llm_provider == "google":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            self.llm = ChatGoogleGenerativeAI(
+                model=model_name,
+                temperature=temperature,
+                timeout=request_timout,
+                google_api_key=llm_api_key,
+            )
+        else:
+            self.llm = ChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                request_timeout=request_timout,
+                base_url=llm_base_url,
+                api_key=llm_api_key if llm_api_key else "ollama",
+            )
         U.f_mkdir(f"{ckpt_dir}/skill/code")
         U.f_mkdir(f"{ckpt_dir}/skill/description")
         U.f_mkdir(f"{ckpt_dir}/skill/vectordb")
@@ -37,17 +59,34 @@ class SkillManager:
             self.skills = {}
         self.retrieval_top_k = retrieval_top_k
         self.ckpt_dir = ckpt_dir
+        # vectordb for skills
         self.vectordb = Chroma(
             collection_name="skill_vectordb",
-            embedding_function=OpenAIEmbeddings(),
+            embedding_function=OpenAIEmbeddings(api_key=llm_api_key) if llm_api_key else OpenAIEmbeddings(),
             persist_directory=f"{ckpt_dir}/skill/vectordb",
         )
-        assert self.vectordb._collection.count() == len(self.skills), (
-            f"Skill Manager's vectordb is not synced with skills.json.\n"
-            f"There are {self.vectordb._collection.count()} skills in vectordb but {len(self.skills)} skills in skills.json.\n"
-            f"Did you set resume=False when initializing the manager?\n"
-            f"You may need to manually delete the vectordb directory for running from scratch."
-        )
+        if self.vectordb._collection.count() != len(self.skills):
+            print(f"\033[33mSkill Manager's vectordb is not synced with skills.json. Re-indexing...\033[0m")
+            # Always clear existing if any to avoid duplicates/conflicts
+            if self.vectordb._collection.count() > 0:
+                all_ids = self.vectordb._collection.get()['ids']
+                if all_ids:
+                    self.vectordb._collection.delete(ids=all_ids)
+            
+            if len(self.skills) > 0:
+                self.vectordb.add_texts(
+                    texts=[entry["description"] for entry in self.skills.values()],
+                    ids=list(self.skills.keys()),
+                    metadatas=[{"name": name} for name in self.skills.keys()],
+                )
+            
+            count = self.vectordb._collection.count()
+            expected = len(self.skills)
+            if count != expected:
+                raise AssertionError(
+                    f"Skill Manager's vectordb is not synced with skills.json.\n"
+                    f"There are {count} skills in vectordb but {expected} skills in skills.json after re-indexing.\n"
+                )
 
     @property
     def programs(self):
@@ -97,7 +136,6 @@ class SkillManager:
             f"{self.ckpt_dir}/skill/description/{dumped_program_name}.txt",
         )
         U.dump_json(self.skills, f"{self.ckpt_dir}/skill/skills.json")
-        self.vectordb.persist()
 
     def generate_skill_description(self, program_name, program_code):
         messages = [
@@ -108,7 +146,7 @@ class SkillManager:
                 + f"The main function is `{program_name}`."
             ),
         ]
-        skill_description = f"    // { self.llm(messages).content}"
+        skill_description = f"    // { self.llm.invoke(messages).content}"
         return f"async function {program_name}(bot) {{\n{skill_description}\n}}"
 
     def retrieve_skills(self, query):

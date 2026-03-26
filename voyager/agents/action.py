@@ -3,9 +3,9 @@ import time
 
 import voyager.utils as U
 from javascript import require
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import SystemMessagePromptTemplate
-from langchain.schema import AIMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import SystemMessagePromptTemplate
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from voyager.prompts import load_prompt
 from voyager.control_primitives_context import load_control_primitives_context
@@ -21,6 +21,9 @@ class ActionAgent:
         resume=False,
         chat_log=True,
         execution_error=True,
+        llm_provider="ollama",
+        llm_api_key=None,
+        llm_base_url=None,
     ):
         self.ckpt_dir = ckpt_dir
         self.chat_log = chat_log
@@ -31,11 +34,31 @@ class ActionAgent:
             self.chest_memory = U.load_json(f"{ckpt_dir}/action/chest_memory.json")
         else:
             self.chest_memory = {}
-        self.llm = ChatOpenAI(
-            model_name=model_name,
-            temperature=temperature,
-            request_timeout=request_timout,
-        )
+        
+        if llm_provider == "groq":
+            from langchain_groq import ChatGroq
+            self.llm = ChatGroq(
+                model_name=model_name,
+                temperature=temperature,
+                request_timeout=request_timout,
+                groq_api_key=llm_api_key,
+            )
+        elif llm_provider == "google":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            self.llm = ChatGoogleGenerativeAI(
+                model=model_name,
+                temperature=temperature,
+                timeout=request_timout,
+                google_api_key=llm_api_key,
+            )
+        else:
+            self.llm = ChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                request_timeout=request_timout,
+                base_url=llm_base_url,
+                api_key=llm_api_key if llm_api_key else "ollama",
+            )
 
     def update_chest_memory(self, chests):
         for position, chest in chests.items():
@@ -83,7 +106,8 @@ class ActionAgent:
             "smeltItem",
             "killMob",
         ]
-        if not self.llm.model_name == "gpt-3.5-turbo":
+        model_name = getattr(self.llm, "model_name", getattr(self.llm, "model", ""))
+        if not model_name == "gpt-3.5-turbo":
             base_skills += [
                 "useChest",
                 "mineflayer",
@@ -109,11 +133,24 @@ class ActionAgent:
         assert events[-1][0] == "observe", "Last event must be observe"
         for i, (event_type, event) in enumerate(events):
             if event_type == "onChat":
-                chat_messages.append(event["onChat"])
+                for chat_item in event["onChat"]:
+                    if isinstance(chat_item, list) and len(chat_item) >= 2:
+                        username, message = chat_item[0], chat_item[1]
+                        if isinstance(message, list):
+                            message = " ".join(str(m) for m in message)
+                    else:
+                        username, message = "Unknown", str(chat_item)
+                    chat_messages.append(f"{username}: {message}")
             elif event_type == "onError":
-                error_messages.append(event["onError"])
+                err = event["onError"]
+                if isinstance(err, list):
+                    err = " ".join(str(e) for e in err)
+                error_messages.append(str(err))
             elif event_type == "onDamage":
-                damage_messages.append(event["onDamage"])
+                dmg = event["onDamage"]
+                if isinstance(dmg, list):
+                    dmg = " ".join(str(d) for d in dmg)
+                damage_messages.append(str(dmg))
             elif event_type == "observe":
                 biome = event["status"]["biome"]
                 time_of_day = event["status"]["timeOfDay"]
@@ -201,6 +238,11 @@ class ActionAgent:
     def process_ai_message(self, message):
         assert isinstance(message, AIMessage)
 
+        # Handle cases where message.content is a list of dicts (Gemini 3)
+        content = U.extract_text_from_ai_message(message.content)
+        
+        print(f"\033[31m****Action Agent ai message****\n{content}\033[0m")
+
         retry = 3
         error = None
         while retry > 0:
@@ -208,8 +250,10 @@ class ActionAgent:
                 babel = require("@babel/core")
                 babel_generator = require("@babel/generator").default
 
-                code_pattern = re.compile(r"```(?:javascript|js)(.*?)```", re.DOTALL)
-                code = "\n".join(code_pattern.findall(message.content))
+                code_pattern = re.compile(
+                    r"```(?:javascript|js)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE
+                )
+                code = "\n".join(code_pattern.findall(content))
                 parsed = babel.parse(code)
                 functions = []
                 assert len(list(parsed.program.body)) > 0, "No functions found"
@@ -274,7 +318,14 @@ class ActionAgent:
         chatlog = set()
         for event_type, event in events:
             if event_type == "onChat":
-                item = filter_item(event["onChat"])
-                if item:
-                    chatlog.add(item)
+                for chat_item in event["onChat"]:
+                    if isinstance(chat_item, list) and len(chat_item) >= 2:
+                        message = chat_item[1]
+                        if isinstance(message, list):
+                            message = " ".join(str(m) for m in message)
+                    else:
+                        message = str(chat_item)
+                    item = filter_item(message)
+                    if item:
+                        chatlog.add(item)
         return "I also need " + ", ".join(chatlog) + "." if chatlog else ""

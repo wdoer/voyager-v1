@@ -21,27 +21,31 @@ class Voyager:
         azure_login: Dict[str, str] = None,
         server_port: int = 3000,
         openai_api_key: str = None,
+        groq_api_key: str = None,
+        llm_provider: str = "ollama", # "openai", "groq", "google", or "ollama"
+        llm_base_url: str = "http://localhost:11434/v1", # Used for Ollama/Custom
+        fixed_task: str = None,
         env_wait_ticks: int = 20,
         env_request_timeout: int = 600,
         max_iterations: int = 160,
         reset_placed_if_failed: bool = False,
-        action_agent_model_name: str = "gpt-4",
+        action_agent_model_name: str = None,
         action_agent_temperature: float = 0,
         action_agent_task_max_retries: int = 4,
         action_agent_show_chat_log: bool = True,
         action_agent_show_execution_error: bool = True,
-        curriculum_agent_model_name: str = "gpt-4",
+        curriculum_agent_model_name: str = None,
         curriculum_agent_temperature: float = 0,
-        curriculum_agent_qa_model_name: str = "gpt-3.5-turbo",
+        curriculum_agent_qa_model_name: str = None,
         curriculum_agent_qa_temperature: float = 0,
         curriculum_agent_warm_up: Dict[str, int] = None,
         curriculum_agent_core_inventory_items: str = r".*_log|.*_planks|stick|crafting_table|furnace"
         r"|cobblestone|dirt|coal|.*_pickaxe|.*_sword|.*_axe",
         curriculum_agent_mode: str = "auto",
-        critic_agent_model_name: str = "gpt-4",
+        critic_agent_model_name: str = None,
         critic_agent_temperature: float = 0,
         critic_agent_mode: str = "auto",
-        skill_manager_model_name: str = "gpt-3.5-turbo",
+        skill_manager_model_name: str = None,
         skill_manager_temperature: float = 0,
         skill_manager_retrieval_top_k: int = 5,
         openai_api_request_timeout: int = 240,
@@ -111,8 +115,25 @@ class Voyager:
         self.reset_placed_if_failed = reset_placed_if_failed
         self.max_iterations = max_iterations
 
-        # set openai api key
-        os.environ["OPENAI_API_KEY"] = openai_api_key
+        # Handle model defaults if not provided
+        if not action_agent_model_name:
+            action_agent_model_name = "llama-3.3-70b-versatile" if llm_provider == "groq" else "qwen2.5-coder:14b" if llm_provider == "ollama" else "gpt-4o"
+        if not curriculum_agent_model_name:
+            curriculum_agent_model_name = action_agent_model_name
+        if not curriculum_agent_qa_model_name:
+            curriculum_agent_qa_model_name = action_agent_model_name
+        if not critic_agent_model_name:
+            critic_agent_model_name = action_agent_model_name
+        if not skill_manager_model_name:
+            skill_manager_model_name = action_agent_model_name
+
+        # set api keys
+        if openai_api_key:
+            os.environ["OPENAI_API_KEY"] = openai_api_key
+        if groq_api_key:
+            os.environ["GROQ_API_KEY"] = groq_api_key
+        if llm_provider == "google" and openai_api_key:
+            os.environ["GOOGLE_API_KEY"] = openai_api_key
 
         # init agents
         self.action_agent = ActionAgent(
@@ -123,6 +144,9 @@ class Voyager:
             resume=resume,
             chat_log=action_agent_show_chat_log,
             execution_error=action_agent_show_execution_error,
+            llm_provider=llm_provider,
+            llm_api_key=openai_api_key if openai_api_key else groq_api_key,
+            llm_base_url=llm_base_url,
         )
         self.action_agent_task_max_retries = action_agent_task_max_retries
         self.curriculum_agent = CurriculumAgent(
@@ -136,12 +160,19 @@ class Voyager:
             mode=curriculum_agent_mode,
             warm_up=curriculum_agent_warm_up,
             core_inventory_items=curriculum_agent_core_inventory_items,
+            llm_provider=llm_provider,
+            llm_api_key=openai_api_key if openai_api_key else groq_api_key,
+            llm_base_url=llm_base_url,
+            fixed_task=fixed_task,
         )
         self.critic_agent = CriticAgent(
             model_name=critic_agent_model_name,
             temperature=critic_agent_temperature,
             request_timout=openai_api_request_timeout,
             mode=critic_agent_mode,
+            llm_provider=llm_provider,
+            llm_api_key=openai_api_key if openai_api_key else groq_api_key,
+            llm_base_url=llm_base_url,
         )
         self.skill_manager = SkillManager(
             model_name=skill_manager_model_name,
@@ -150,6 +181,9 @@ class Voyager:
             request_timout=openai_api_request_timeout,
             ckpt_dir=skill_library_dir if skill_library_dir else ckpt_dir,
             resume=True if resume or skill_library_dir else False,
+            llm_provider=llm_provider,
+            llm_api_key=openai_api_key if openai_api_key else groq_api_key,
+            llm_base_url=llm_base_url,
         )
         self.recorder = U.EventRecorder(ckpt_dir=ckpt_dir, resume=resume)
         self.resume = resume
@@ -203,7 +237,7 @@ class Voyager:
     def step(self):
         if self.action_agent_rollout_num_iter < 0:
             raise ValueError("Agent must be reset before stepping")
-        ai_message = self.action_agent.llm(self.messages)
+        ai_message = self.action_agent.llm.invoke(self.messages)
         print(f"\033[34m****Action Agent ai message****\n{ai_message.content}\033[0m")
         self.conversations.append(
             (self.messages[0].content, self.messages[1].content, ai_message.content)
@@ -292,7 +326,7 @@ class Voyager:
                 break
         return messages, reward, done, info
 
-    def learn(self, reset_env=True):
+    def learn(self, reset_env=True, init_task=None, init_context=""):
         if self.resume:
             # keep the inventory
             self.env.reset(
@@ -316,11 +350,17 @@ class Voyager:
             if self.recorder.iteration > self.max_iterations:
                 print("Iteration limit reached")
                 break
-            task, context = self.curriculum_agent.propose_next_task(
-                events=self.last_events,
-                chest_observation=self.action_agent.render_chest_observation(),
-                max_retries=5,
-            )
+            
+            if init_task:
+                task = init_task
+                context = init_context
+                init_task = None
+            else:
+                task, context = self.curriculum_agent.propose_next_task(
+                    events=self.last_events,
+                    chest_observation=self.action_agent.render_chest_observation(),
+                    max_retries=5,
+                )
             print(
                 f"\033[35mStarting task {task} for at most {self.action_agent_task_max_retries} times\033[0m"
             )

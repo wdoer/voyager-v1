@@ -6,8 +6,14 @@ from .file_utils import f_join
 
 def json_load(*file_path, **kwargs):
     file_path = f_join(file_path)
-    with open(file_path, "r") as fp:
-        return json.load(fp, **kwargs)
+    try:
+        with open(file_path, "r", encoding="utf-8-sig") as fp:
+            content = fp.read()
+            if not content.strip():
+                return {}
+            return json.loads(content, **kwargs)
+    except FileNotFoundError:
+        return {}
 
 
 def json_loads(string, **kwargs):
@@ -16,7 +22,7 @@ def json_loads(string, **kwargs):
 
 def json_dump(data, *file_path, **kwargs):
     file_path = f_join(file_path)
-    with open(file_path, "w") as fp:
+    with open(file_path, "w", encoding="utf-8") as fp:
         json.dump(data, fp, **kwargs)
 
 
